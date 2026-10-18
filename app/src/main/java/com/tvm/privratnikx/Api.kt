@@ -14,6 +14,9 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 
+/** [stream] — живой MPEG-TS (Flussonic); null — показываем снимки (режим эмуляции). */
+data class Camera(val camId: String, val stream: String?)
+
 data class Barrier(val id: String, val address: String, val enabled: Boolean = true)
 
 /** Клиент api.privratnik.net. Все методы блокирующие — звать из фонового потока. */
@@ -43,9 +46,9 @@ object Api {
         return parseOpen(post(body, timeoutMs = 5_000).second)
     }
 
-    /** Камеры шлагбаумов: barrier_id → camId. */
-    fun getCameras(phone: String, key: String): Map<String, String> {
-        if (useStub) return stub(mapOf("123" to "stub", "456" to "stub"))
+    /** Камеры шлагбаумов: barrier_id → камера. */
+    fun getCameras(phone: String, key: String): Map<String, Camera> {
+        if (useStub) return stub(mapOf("123" to Camera("stub", null), "456" to Camera("stub", null)))
         return parseCameras(post(mapOf("cam" to "", "key" to key, "login" to phone)).second)
     }
 
@@ -77,15 +80,18 @@ object Api {
     }
 
     /** Ответ — массив массивов камер: [[{"id","camId","domain","token","barrier_id",…}]]. */
-    fun parseCameras(json: String): Map<String, String> {
-        val result = mutableMapOf<String, String>()
+    fun parseCameras(json: String): Map<String, Camera> {
+        val result = mutableMapOf<String, Camera>()
         val outer = JSONArray(json)
         for (i in 0 until outer.length()) {
             val inner = outer.optJSONArray(i) ?: continue
             for (j in 0 until inner.length()) {
                 val c = inner.getJSONObject(j)
                 val barrierId = c.optString("barrier_id")
-                if (barrierId !in result) result[barrierId] = c.optString("camId")
+                if (barrierId !in result) result[barrierId] = Camera(
+                    c.optString("camId"),
+                    "https://${c.optString("domain")}/${c.optString("id")}/mpegts?token=${c.optString("token")}"
+                )
             }
         }
         return result

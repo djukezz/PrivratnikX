@@ -27,9 +27,9 @@ class ApiTest {
         assertTrue(Api.parseOpen("""{"state":1}"""))
         assertFalse(Api.parseOpen("""{"state":0}"""))
         assertEquals(
-            mapOf("20253" to "1"),
-            Api.parseCameras("""[[{"id":"ab_1","camId":"1","barrier_id":"20253"},""" +
-                """{"id":"ab_2","camId":"2","barrier_id":"20253"}]]""")
+            mapOf("20253" to Camera("1", "https://cam0.example/ab_1/mpegts?token=t1")),
+            Api.parseCameras("""[[{"id":"ab_1","camId":"1","domain":"cam0.example","token":"t1","barrier_id":"20253"},""" +
+                """{"id":"ab_2","camId":"2","domain":"cam0.example","token":"t2","barrier_id":"20253"}]]""")
         )
     }
 }

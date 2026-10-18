@@ -17,8 +17,8 @@ android {
         applicationId = "com.tvm.privratnikx"
         minSdk = 28
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
     }
 
     signingConfigs {
@@ -50,6 +50,7 @@ android {
 }
 
 dependencies {
+    implementation("androidx.media3:media3-exoplayer:1.8.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
 }

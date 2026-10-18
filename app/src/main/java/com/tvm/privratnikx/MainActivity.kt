@@ -8,11 +8,23 @@ import android.graphics.drawable.Drawable
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.TypedValue
+import android.view.Gravity
+import android.view.SurfaceView
 import android.view.View
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
 class MainActivity : Activity() {
@@ -23,6 +35,7 @@ class MainActivity : Activity() {
     private var statusColor = 0
     /** Меняется, когда экран уходит в фон или перестраивается: старые циклы снимков завершаются. */
     @Volatile private var generation = 0
+    private val players = mutableListOf<ExoPlayer>()
 
     override fun attachBaseContext(base: Context) = super.attachBaseContext(Prefs.wrap(base))
 
@@ -52,6 +65,8 @@ class MainActivity : Activity() {
     override fun onPause() {
         super.onPause()
         generation++
+        players.forEach { it.release() }
+        players.clear()
     }
 
     // Не уничтожаем экран, а уводим в фон: следующий запуск будет горячим (~100 мс против ~260 мс)
@@ -64,6 +79,8 @@ class MainActivity : Activity() {
 
     private fun buildButtons() {
         generation++
+        players.forEach { it.release() }
+        players.clear()
         barriersView.removeAllViews()
         val barriers = prefs.barriers.filter { it.enabled }
         setStatus(if (barriers.isEmpty()) getString(R.string.no_barriers) else "", false)
@@ -108,42 +125,114 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Половина кнопки с камерой. Кнопка от неё не зависит: кадры грузятся в фоне, тап по картинке = тап по кнопке. */
+    /** Половина кнопки с камерой. Кнопка от неё не зависит: камера грузится в фоне, тап по ней = тап по кнопке. */
     private fun cameraFor(b: Barrier, btn: Button): View {
+        val frame = FrameLayout(this)
+        frame.setBackgroundColor(Color.BLACK)
+        frame.setOnClickListener { btn.performClick() }
         val image = ImageView(this)
-        image.setBackgroundColor(Color.BLACK)
         image.scaleType = ImageView.ScaleType.FIT_CENTER
-        image.setOnClickListener { btn.performClick() }
-        startSnapshots(image, b)
-        return image
+        frame.addView(image, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        startCamera(frame, image, b)
+        return frame
     }
 
     /**
-     * Снимок раз в секунду вместо видео: у снимка задержка 1–2 с, а у потока во встроенном плеере — 30–45 с.
-     * ponytail: ~80 КБ на кадр (~5 МБ/мин, пока экран открыт); ExoPlayer + mpegts, если нужны настоящие 6 кадров/с.
+     * Снимок раз в секунду; если есть живой поток — параллельно запускаем его, и когда он пошёл
+     * (это до ~8 с: ждём опорный кадр), убираем снимок. Без потока (режим эмуляции) — только снимки.
      */
-    private fun startSnapshots(image: ImageView, b: Barrier) {
+    private fun startCamera(frame: FrameLayout, image: ImageView, b: Barrier) {
         val gen = generation
         val phone = prefs.phone
         val key = prefs.key
+        val streaming = AtomicBoolean() // поток пошёл — снимки больше не нужны
         thread {
-            var camId: String? = null
-            while (gen == generation) {
+            var cam: Camera? = null
+            while (gen == generation && !streaming.get()) {
                 val started = SystemClock.elapsedRealtime()
                 try {
-                    if (camId == null) {
-                        camId = Api.getCameras(phone, key)[b.id]
-                        if (camId == null) return@thread AppLog.d("No camera for barrier ${b.id}")
+                    if (cam == null) {
+                        cam = Api.getCameras(phone, key)[b.id] ?: return@thread AppLog.d("No camera for barrier ${b.id}")
+                        val stream = cam.stream
+                        if (stream != null) runOnUiThread { if (gen == generation) startPlayer(frame, image, streaming, stream, gen) }
                     }
-                    val bmp = Api.snapshot(phone, key, camId)
-                    runOnUiThread { if (gen == generation) image.setImageBitmap(bmp) }
+                    val bmp = Api.snapshot(phone, key, cam.camId)
+                    runOnUiThread { if (gen == generation && !streaming.get()) image.setImageBitmap(bmp) }
                     Thread.sleep((1_000 - (SystemClock.elapsedRealtime() - started)).coerceAtLeast(0))
                 } catch (e: Exception) {
-                    AppLog.d("Snapshot ${b.id} failed", e)
+                    AppLog.d("Camera ${b.id} failed", e)
                     Thread.sleep(3_000)
                 }
             }
         }
+    }
+
+    /**
+     * Живой MPEG-TS через ExoPlayer с маленьким буфером: задержка ~3 с вместо 30–45 с у встроенного плеера.
+     * Всё скачанное сверх текущей позиции — это отставание от реального времени; если оно выросло
+     * (сеть подвисла), догоняем ускоренным воспроизведением.
+     */
+    private fun startPlayer(frame: FrameLayout, image: ImageView, streaming: AtomicBoolean, url: String, gen: Int) {
+        val created = SystemClock.elapsedRealtime()
+        val surface = SurfaceView(this)
+        // Под снимком: SurfaceView рисуется под окном, непрозрачная картинка его закрывает, пока видео не пошло
+        frame.addView(surface, 0, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT, Gravity.CENTER))
+        val player = ExoPlayer.Builder(this)
+            .setLoadControl(DefaultLoadControl.Builder().setBufferDurationsMs(1_000, 3_000, 500, 1_000).build())
+            .build()
+        players.add(player)
+        val source = ProgressiveMediaSource.Factory(DefaultHttpDataSource.Factory())
+            .createMediaSource(MediaItem.fromUri(url))
+        var playing = false
+        fun reconnect(why: String) {
+            if (gen != generation) return
+            AppLog.d("Stream reconnect: $why")
+            playing = false
+            player.setMediaSource(source)
+            player.prepare()
+        }
+        player.addListener(object : Player.Listener {
+            override fun onPlaybackStateChanged(state: Int) {
+                when (state) {
+                    Player.STATE_READY -> if (!playing) {
+                        playing = true
+                        streaming.set(true)
+                        image.visibility = View.GONE
+                        AppLog.d("Stream started in ${SystemClock.elapsedRealtime() - created} ms")
+                    }
+                    Player.STATE_ENDED -> reconnect("ended")
+                }
+            }
+
+            override fun onPlayerError(error: PlaybackException) {
+                AppLog.d("Stream error: ${error.errorCodeName}", error)
+                frame.postDelayed({ reconnect("error") }, 3_000)
+            }
+
+            override fun onVideoSizeChanged(size: VideoSize) {
+                if (size.width == 0 || size.height == 0) return
+                val scale = minOf(frame.width / size.width.toFloat(), frame.height / size.height.toFloat())
+                surface.layoutParams = FrameLayout.LayoutParams((size.width * scale).toInt(), (size.height * scale).toInt(), Gravity.CENTER)
+            }
+        })
+        val catchUp = object : Runnable {
+            override fun run() {
+                if (gen != generation) return
+                val lag = player.bufferedPosition - player.currentPosition
+                val speed = if (lag > 1_500) 1.5f else if (lag < 700) 1f else player.playbackParameters.speed
+                if (speed != player.playbackParameters.speed) {
+                    AppLog.d("Stream lag $lag ms, speed $speed")
+                    player.setPlaybackSpeed(speed)
+                }
+                frame.postDelayed(this, 1_000)
+            }
+        }
+        frame.postDelayed(catchUp, 1_000)
+        player.setVideoSurfaceView(surface)
+        player.setMediaSource(source)
+        player.playWhenReady = true
+        player.prepare()
+        AppLog.d("Player created in ${SystemClock.elapsedRealtime() - created} ms")
     }
 
     /** Красим копию стандартного фона: backgroundTintList не вернуть к исходному цвету кнопки. */
