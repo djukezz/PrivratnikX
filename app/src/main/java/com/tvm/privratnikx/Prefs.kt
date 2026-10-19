@@ -5,6 +5,7 @@ import android.content.res.Configuration
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -14,6 +15,7 @@ class Prefs(ctx: Context) {
 
     init {
         Api.useStub = emulation
+        AppLog.app = ctx.applicationContext ?: ctx
     }
 
     var phone: String
@@ -86,16 +88,37 @@ class Prefs(ctx: Context) {
     }
 }
 
-/** Лог в памяти для экрана «Лог» + logcat. */
+/**
+ * Лог: logcat, память (экран «Лог») и файл /Android/data/<пакет>/files/гггг_мм_дд.txt.
+ * Ключ, токены и сессии маскируются: на Android 9 эту папку могут читать другие приложения.
+ */
 object AppLog {
     private val lines = ArrayDeque<String>()
     private val fmt = SimpleDateFormat("HH:mm:ss", Locale.US)
+    private val fileFmt = SimpleDateFormat("yyyy_MM_dd", Locale.US)
+    @Volatile var app: Context? = null
+    private val dir by lazy { app?.getExternalFilesDir(null) }
+
+    private val secrets = listOf(
+        Regex("""\b([0-9a-fA-F]{4})[0-9a-fA-F]{28}\b""") to "$1…", // ключ
+        Regex(""""(token|session)":"[^"]+"""") to "\"$1\":\"***\"", // в JSON
+        Regex("""token=[^&\s"]+""") to "token=***", // в ссылке
+    )
+
+    fun mask(s: String) = secrets.fold(s) { acc, (re, to) -> re.replace(acc, to) }
 
     @Synchronized
     fun d(msg: String, t: Throwable? = null) {
-        Log.d("PrivratnikX", msg, t)
-        lines.addLast("${fmt.format(Date())} $msg" + (t?.let { "\n  $it" } ?: ""))
+        val now = Date()
+        val line = "${fmt.format(now)} ${mask(msg)}" + (t?.let { "\n  ${mask(it.toString())}" } ?: "")
+        Log.d("PrivratnikX", line)
+        lines.addLast(line)
         if (lines.size > 500) lines.removeFirst()
+        // ponytail: запись в главном потоке — строк единицы в минуту; старые файлы не удаляются
+        try {
+            dir?.let { File(it, fileFmt.format(now) + ".txt").appendText(line + "\n") }
+        } catch (_: Exception) {
+        }
     }
 
     @Synchronized

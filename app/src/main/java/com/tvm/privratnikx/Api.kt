@@ -107,7 +107,8 @@ object Api {
         }
     }
 
-    fun parseOpen(json: String) = JSONObject(json).optInt("state") == 1
+    /** Старый сервер отвечал {"state":1}, нынешний — {"state":"ok"}. */
+    fun parseOpen(json: String) = JSONObject(json).optString("state") in setOf("1", "ok")
 
     fun isPhoneValid(s: String) = s.length == 11 && s[0] == '7' && s.all { it in '0'..'9' }
     fun isSmsValid(s: String) = s.length == 5 && s.all { it in '0'..'9' }
